@@ -63,6 +63,10 @@ func makeHTTPClientFromProxy(proxyArg string) (*http.Client, error) {
 		fmtProxy = fmt.Sprintf("socks5://hydroxide_%s::@%s", un, proxyArg)
 
 	} else {
+		if !strings.Contains(proxyArg, "://") {
+			// Assume socks5:// if no scheme is provided
+			proxyArg = "socks5://" + proxyArg
+		}
 		fmtProxy = proxyArg // Don't hard code socks5://
 	}
 
