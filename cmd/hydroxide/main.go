@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -28,10 +29,12 @@ import (
 	"github.com/emersion/hydroxide/imports"
 	"github.com/emersion/hydroxide/protonmail"
 	smtpbackend "github.com/emersion/hydroxide/smtp"
+	"github.com/google/uuid"
 )
 
 const (
 	defaultAPIEndpoint = "https://mail.proton.me/api"
+	torAPIEndpoint     = "https://mail.protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion/api"
 	defaultAppVersion  = "Other"
 )
 
@@ -40,19 +43,50 @@ var (
 	apiEndpoint string
 	appVersion  string
 	proxyURL    string
+	tor         bool
 )
 
-func newClient() *protonmail.Client {
-	httpClient := http.DefaultClient
-	if proxyURL != "" {
-		proxyURL, err := url.Parse(proxyURL)
+func makeHTTPClientFromProxy(proxyArg string) (*http.Client, error) {
+	fmtProxy := ""
+	client := &http.Client{}
+	if tor {
+		un, err := uuid.NewRandom()
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
-		httpClient.Transport = &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
+		// Tor requires socks5. To keep the same format as without tor, we allow
+		// the user to specify socks5:// in the proxy URL.
+		// But we remove it
+		if strings.HasPrefix(proxyArg, "socks5://") {
+			proxyArg = strings.Replace(proxyArg, "socks5://", "", 1)
 		}
-		http.DefaultTransport = httpClient.Transport
+		fmtProxy = fmt.Sprintf("socks5://hydroxide_%s::@%s", un, proxyArg)
+
+	} else {
+		fmtProxy = proxyArg // Don't hard code socks5://
+	}
+
+	proxy, err := url.Parse(fmtProxy)
+	if err != nil {
+		return nil, err
+	}
+
+	tr := &http.Transport{
+		Proxy: http.ProxyURL(proxy),
+	}
+
+	client = &http.Client{Transport: tr}
+	return client, nil
+}
+func newClient() *protonmail.Client {
+	httpClient := &http.Client{}
+	if proxyURL != "" {
+		proxiedClient, err := makeHTTPClientFromProxy(proxyURL)
+		if err != nil {
+			log.Fatal("Error creating proxied http.Client: ", err)
+		}
+
+		httpClient = proxiedClient
 	}
 	return &protonmail.Client{
 		RootURL:    apiEndpoint,
@@ -227,6 +261,7 @@ func main() {
 
 	configHome := flag.String("config-home", "", "Path to the directory where hydroxide stores its configuration")
 	flag.StringVar(&proxyURL, "proxy-url", "", "HTTP proxy URL (e.g. socks5://127.0.0.1:1080)")
+	flag.BoolVar(&tor, "tor", false, "If set, connect to ProtonMail over Tor")
 
 	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
 	exportSecretKeysCmd := flag.NewFlagSet("export-secret-keys", flag.ExitOnError)
@@ -241,6 +276,15 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if tor && proxyURL == "" {
+		log.Fatal("Need -proxy to connect to ProtonMail over Tor")
+	}
+
+	if tor {
+		log.Println("Connecting to ProtonMail over Tor")
+		apiEndpoint = torAPIEndpoint
+	}
 
 	tlsConfig, err := config.TLS(*tlsCert, *tlsCertKey, *tlsClientCA)
 	if err != nil {
