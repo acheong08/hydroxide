@@ -3,12 +3,14 @@ package protonmail
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -135,7 +137,7 @@ func (t CalendarEventCardType) Signed() bool {
 
 func (t CalendarEventCardType) Encrypted() bool {
 	switch t {
-	case CalendarEventCardEncryptedAndSigned:
+	case CalendarEventCardEncrypted, CalendarEventCardEncryptedAndSigned:
 		return true
 	default:
 		return false
@@ -351,7 +353,7 @@ type CalendarEventFilter struct {
 	Page, PageSize int
 }
 
-func (c *Client) ListCalendarEvents(calendarID string, filter *CalendarEventFilter) ([]*CalendarEvent, error) {
+func (c *Client) listCalendarEventsPage(calendarID string, filter *CalendarEventFilter) ([]*CalendarEvent, error) {
 	v := url.Values{}
 
 	if filter != nil {
@@ -378,6 +380,30 @@ func (c *Client) ListCalendarEvents(calendarID string, filter *CalendarEventFilt
 	}
 
 	return respData.Events, nil
+}
+
+func (c *Client) ListCalendarEvents(calendarID string, filter *CalendarEventFilter) ([]*CalendarEvent, error) {
+	const pageSize = 100
+	var allEvents []*CalendarEvent
+
+	if filter == nil {
+		filter = &CalendarEventFilter{}
+	}
+	filter.PageSize = pageSize
+
+	for page := 0; ; page++ {
+		filter.Page = page
+		events, err := c.listCalendarEventsPage(calendarID, filter)
+		if err != nil {
+			return nil, err
+		}
+		allEvents = append(allEvents, events...)
+		if len(events) < pageSize {
+			break
+		}
+	}
+
+	return allEvents, nil
 }
 
 func (c *Client) GetCalendarEvent(calendarID string, eventID string) (*CalendarEvent, error) {
@@ -762,10 +788,20 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		notification := CalendarNotification{}
 
 		action := child.Props.Get("ACTION")
+		if action == nil {
+			continue
+		}
 		notification.Type = ValarmActionToCalendarNotificationType(action.Value)
 
 		trigger := child.Props.Get("TRIGGER")
-		notification.Trigger = trigger.Value
+		if trigger == nil {
+			continue
+		}
+		if normalized, ok := normalizeAlarmTrigger(&event, trigger); ok {
+			notification.Trigger = normalized
+		} else {
+			continue
+		}
 
 		notifications = append(notifications, notification)
 	}
@@ -889,12 +925,20 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 }
 
 func (c *Client) UpdateCalendarEvent(calID string, eventID string, event ical.Event, userKr openpgp.KeyRing) (*CalendarEvent, error) {
-	oldEvent, err := c.GetCalendarEvent(calID, eventID)
-	isCreate := false
-	if apiErr, ok := err.(*APIError); ok && apiErr.Code == 2061 {
+	isCreate := eventID == ""
+	var oldEvent *CalendarEvent
+	if !isCreate {
+		var err error
+		oldEvent, err = c.GetCalendarEvent(calID, eventID)
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == 2061 {
+			isCreate = true
+		} else if err != nil {
+			return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
+		}
+	}
+	if oldEvent == nil {
 		isCreate = true
-	} else if err != nil {
-		return nil, fmt.Errorf("UpdateCalendarEvent: could not get old calendar event: (%w)", err)
 	}
 
 	data, memberID, err := makeUpdateData(c, calID, oldEvent, event, userKr)
@@ -942,10 +986,119 @@ func (c *Client) UpdateCalendarEvent(calID string, eventID string, event ical.Ev
 	}
 
 	if len(respData.Responses) != 1 || respData.Responses[0].Response.Event == nil {
+		if len(respData.Responses) == 1 {
+			if err := respData.Responses[0].Response.Err(); err != nil {
+				return nil, fmt.Errorf("UpdateCalendarEvent: sync error: (%w)", err)
+			}
+		}
 		return nil, fmt.Errorf("UpdateCalendarEvent: no event on events sync response")
 	}
 
 	return respData.Responses[0].Response.Event, nil
+}
+
+func normalizeAlarmTrigger(event *ical.Event, trigger *ical.Prop) (string, bool) {
+	raw := strings.TrimSpace(trigger.Value)
+	if raw == "" {
+		return "", false
+	}
+	if isDurationString(raw) {
+		return raw, true
+	}
+
+	triggerTime, ok := parseICalDateTime(raw)
+	if !ok {
+		return "", false
+	}
+
+	startProp := event.Props.Get("DTSTART")
+	if startProp == nil || startProp.Value == "" {
+		return "", false
+	}
+	startTime, ok := parseICalDateTime(startProp.Value)
+	if !ok {
+		return "", false
+	}
+
+	dur := triggerTime.Sub(startTime)
+	if dur > 365*24*time.Hour || dur < -365*24*time.Hour {
+		return "", false
+	}
+	return formatICalDuration(dur), true
+}
+
+func isDurationString(v string) bool {
+	if v == "" {
+		return false
+	}
+	if strings.HasPrefix(v, "P") || strings.HasPrefix(v, "+P") || strings.HasPrefix(v, "-P") {
+		return true
+	}
+	return false
+}
+
+func parseICalDateTime(v string) (time.Time, bool) {
+	if v == "" {
+		return time.Time{}, false
+	}
+	if strings.HasSuffix(v, "Z") {
+		t, err := time.Parse("20060102T150405Z", v)
+		if err == nil {
+			return t, true
+		}
+	}
+	if len(v) == len("20060102T150405") {
+		t, err := time.Parse("20060102T150405", v)
+		if err == nil {
+			return t, true
+		}
+	}
+	if len(v) == len("20060102") {
+		t, err := time.Parse("20060102", v)
+		if err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func formatICalDuration(d time.Duration) string {
+	sign := ""
+	if d < 0 {
+		sign = "-"
+		d = -d
+	}
+
+	seconds := int64(d.Seconds())
+	days := seconds / 86400
+	seconds %= 86400
+	hours := seconds / 3600
+	seconds %= 3600
+	mins := seconds / 60
+	secs := seconds % 60
+
+	var b strings.Builder
+	b.WriteString(sign)
+	b.WriteString("P")
+	if days > 0 {
+		fmt.Fprintf(&b, "%dD", days)
+	}
+	if hours > 0 || mins > 0 || secs > 0 {
+		b.WriteString("T")
+		if hours > 0 {
+			fmt.Fprintf(&b, "%dH", hours)
+		}
+		if mins > 0 {
+			fmt.Fprintf(&b, "%dM", mins)
+		}
+		if secs > 0 || (hours == 0 && mins == 0) {
+			fmt.Fprintf(&b, "%dS", secs)
+		}
+	}
+	if days == 0 && hours == 0 && mins == 0 && secs == 0 {
+		b.WriteString("T0S")
+	}
+	return b.String()
 }
 
 type CalendarEventDeleteSyncEntry struct {

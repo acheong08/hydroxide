@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -170,10 +171,30 @@ func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, even
 func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
 	handlers := make(map[string]http.Handler)
 
+	rewriteCalDAVPath := func(req *http.Request) {
+		p := req.URL.Path
+		switch {
+		case p == "/.well-known/caldav" || p == "/.well-known/caldav/":
+			p = "/caldav/"
+		case p == "/caldav" || p == "/caldav/":
+			p = "/caldav/"
+		}
+		if p != req.URL.Path {
+			req.URL.Path = p
+			req.URL.RawPath = p
+			if req.URL.RawQuery != "" {
+				req.RequestURI = p + "?" + req.URL.RawQuery
+			} else {
+				req.RequestURI = p
+			}
+		}
+	}
+
 	s := &http.Server{
 		Addr:      addr,
 		TLSConfig: tlsConfig,
 		Handler: http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+			rewriteCalDAVPath(req)
 			resp.Header().Set("WWW-Authenticate", "Basic")
 
 			username, password, ok := req.BasicAuth()
@@ -203,12 +224,36 @@ func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager 
 				handlers[username] = h
 			}
 
+			if debug {
+				start := time.Now()
+				sw := &statusWriter{ResponseWriter: resp}
+				h.ServeHTTP(sw, req)
+				log.Printf("CalDAV %s %s -> %d (%s)", req.Method, req.URL.Path, sw.status, time.Since(start))
+				return
+			}
 			h.ServeHTTP(resp, req)
 		}),
 	}
 
 	log.Println("CalDAV server listening on", s.Addr)
 	return s.ListenAndServe()
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
