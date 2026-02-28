@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -59,7 +60,11 @@ func readEventCard(event *ical.Event, eventCard protonmail.CalendarEventCard, us
 	}*/
 
 	if err := md.SignatureError; err != nil {
-		return nil, fmt.Errorf("caldav/readEventCard: signature error: (%w)", err)
+		// Signature verification can fail for shared calendar events when
+		// the signer's key isn't available (e.g. different user, rotated
+		// keys). Log the error but continue — the event data is still
+		// readable, we just can't verify who signed it.
+		log.Printf("caldav/readEventCard: signature verification failed (non-fatal): %v", err)
 	}
 
 	children := decoded.Events()
@@ -359,14 +364,15 @@ func (b *backend) QueryCalendarObjects(ctx context.Context, path string, query *
 		return nil, fmt.Errorf("caldav/QueryCalendarObjects: error decrypting keyring: (%w)", err)
 	}
 
-	cos := make([]caldav.CalendarObject, len(events))
+	var cos []caldav.CalendarObject
 	for i, event := range events {
 		co, err := getCalendarObject(b, calId, calKr, event, bootstrap.CalendarSettings)
 		if err != nil {
-			return nil, fmt.Errorf("caldav/QueryCalendarObjects: error creating calendar object for event %d: (%w)", i, err)
+			log.Printf("caldav/QueryCalendarObjects: skipping event %d (ID: %s) due to error: %v", i, event.ID, err)
+			continue
 		}
 
-		cos[i] = *co
+		cos = append(cos, *co)
 	}
 
 	return cos, nil
