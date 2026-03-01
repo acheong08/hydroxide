@@ -183,7 +183,7 @@ func listenAndServeCalDAV(addr string, authManager *auth.Manager, eventsManager 
 				return
 			}
 
-			c, privateKeys, err := authManager.Auth(username, password)
+			c, privateKeys, _, err := authManager.Auth(username, password)
 			if err != nil {
 				if err == auth.ErrUnauthorized {
 					resp.WriteHeader(http.StatusUnauthorized)
@@ -227,7 +227,7 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 				return
 			}
 
-			c, privateKeys, err := authManager.Auth(username, password)
+			c, privateKeys, primaryKeyID, err := authManager.Auth(username, password)
 			if err != nil {
 				if err == auth.ErrUnauthorized {
 					resp.WriteHeader(http.StatusUnauthorized)
@@ -242,7 +242,7 @@ func listenAndServeCardDAV(addr string, authManager *auth.Manager, eventsManager
 			if !ok {
 				ch := make(chan *protonmail.Event)
 				eventsManager.Register(c, username, ch, nil)
-				h = carddav.NewHandler(c, privateKeys, ch)
+				h = carddav.NewHandler(c, privateKeys, primaryKeyID, ch)
 
 				handlers[username] = h
 			}
@@ -427,7 +427,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		_, err = c.Unlock(a, keySalts, mailboxPassword)
+		_, _, err = c.Unlock(a, keySalts, mailboxPassword)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -474,7 +474,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		_, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		_, privateKeys, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -515,7 +515,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		c, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		c, _, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -557,7 +557,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		c, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		c, privateKeys, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -645,7 +645,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		c, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		c, privateKeys, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
 		if err != nil {
 			log.Fatal(err)
 		}
