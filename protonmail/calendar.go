@@ -665,6 +665,21 @@ func getUserKeys(userKr openpgp.KeyRing) *openpgp.Entity {
 	return userKr.(openpgp.EntityList)[0] // Is the first key always the correct one?
 }
 
+// getAddressKeyForEmail finds the key entity in the keyring whose identity
+// matches the given email. Proton requires calendar events to be signed with
+// the address key (not the user key). Falls back to getUserKeys if no match.
+func getAddressKeyForEmail(kr openpgp.KeyRing, email string) *openpgp.Entity {
+	for _, key := range kr.DecryptionKeys() {
+		for _, identity := range key.Entity.Identities {
+			if identity.UserId != nil && identity.UserId.Email == email {
+				return key.Entity
+			}
+		}
+	}
+	// Fallback: return first key (legacy behavior)
+	return getUserKeys(kr)
+}
+
 func encryptPart(part string, key *packet.EncryptedKey, signer *openpgp.Entity, config *packet.Config) (string, error) {
 	var signKey *packet.PrivateKey
 	if signer != nil {
@@ -734,6 +749,14 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		return nil, "", fmt.Errorf("makeUpdateData: failed to decrypt keyring: (%w)", err)
 	}
 
+	// Find the calendar member first — we need their email to select the
+	// correct address key for signing. Proton requires calendar events to
+	// be signed with the address key, not the user key.
+	member, err := FindMemberViewFromKeyring(bootstrap.Members, userKr)
+	if err != nil {
+		return nil, "", fmt.Errorf("makeUpdateData: failed to find member view from keyring: (%w)", err)
+	}
+
 	sharedPartCal, calendarPartCal := getEventParts(&event)
 	sharedPart, err := encodePart(sharedPartCal)
 	if err != nil {
@@ -780,7 +803,10 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 		data.IsOrganizer = 1
 	}
 
-	userKeys := getUserKeys(userKr)
+	// Use the address key matching the calendar member's email for signing.
+	// Proton rejects events signed with the user key (error 2001:
+	// "Provide data signed using the address key").
+	userKeys := getAddressKeyForEmail(userKr, member.Email)
 	if signedSharedPart, ok := sharedPart[CalendarEventCardSigned]; ok && signedSharedPart != "" {
 		signature, err := signPart(signedSharedPart, userKeys, config)
 		if err != nil {
@@ -879,11 +905,6 @@ func makeUpdateData(c *Client, calID string, oldEvent *CalendarEvent, event ical
 	// Removed attendees emails ...
 	// Attendees encrypted session keys ...
 	// Cancelled occurrence parts ...
-
-	member, err := FindMemberViewFromKeyring(bootstrap.Members, userKr)
-	if err != nil {
-		return nil, "", fmt.Errorf("makeUpdateData: failed to find member view from keyring: (%w)", err)
-	}
 
 	return &data, member.ID, nil
 }
