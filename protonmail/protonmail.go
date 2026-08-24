@@ -2,26 +2,36 @@
 package protonmail
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
-
-	"log"
 )
 
 const Version = 3
 
 const headerAPIVersion = "X-Pm-Apiversion"
 
+type HumanVerificationDetails struct {
+	Token   string   `json:"HumanVerificationToken"`
+	Methods []string `json:"HumanVerificationMethods"`
+	Title   string   `json:"Title"`
+}
+
 type resp struct {
-	Code int
+	Code    int                       `json:"Code"`
+	Details *HumanVerificationDetails `json:"Details"`
 	*RawAPIError
 }
 
@@ -30,6 +40,17 @@ func (r *resp) Err() error {
 		return &APIError{
 			Code:    r.Code,
 			Message: err.Message,
+			Details: r.Details,
+		}
+	}
+	if r.Code != 1000 && r.Code != 1001 && r.Code != 0 {
+		// For 9001 the Error field may be present alongside Details
+		if r.Code == 9001 {
+			return &APIError{
+				Code:    r.Code,
+				Message: "Human verification required",
+				Details: r.Details,
+			}
 		}
 	}
 	return nil
@@ -46,11 +67,19 @@ type RawAPIError struct {
 type APIError struct {
 	Code    int
 	Message string
+	Details *HumanVerificationDetails
 }
 
 func (err *APIError) Error() string {
+	if err.Details != nil && err.Details.Token != "" {
+		return fmt.Sprintf("[%v] %v (HV token: %v methods: %v)", err.Code, err.Message, err.Details.Token, err.Details.Methods)
+	}
 	return fmt.Sprintf("[%v] %v", err.Code, err.Message)
 }
+
+const humanVerificationCode = 9001
+const hvTokenHeader = "X-Pm-Human-Verification-Token"
+const hvTokenTypeHeader = "X-Pm-Human-Verification-Token-Type"
 
 type Timestamp int64
 
@@ -159,6 +188,10 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 }
 
 func (c *Client) doJSON(req *http.Request, respData interface{}) error {
+	return c.doJSONWithHVRetry(req, respData, false)
+}
+
+func (c *Client) doJSONWithHVRetry(req *http.Request, respData interface{}, retried bool) error {
 	req.Header.Set("Accept", "application/json")
 
 	if respData == nil {
@@ -171,17 +204,123 @@ func (c *Client) doJSON(req *http.Request, respData interface{}) error {
 	}
 	defer resp.Body.Close()
 
-	if err := json.NewDecoder(resp.Body).Decode(respData); err != nil {
+	// Need to buffer body for potential debug + second decode after HV
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(bodyBytes, respData); err != nil {
 		return err
 	}
 
 	if c.Debug {
 		log.Printf("<< %v %v", req.Method, req.URL.Path)
 		log.Printf("%#v", respData)
+		log.Printf("raw: %s", string(bodyBytes))
 	}
 
 	if maybeError, ok := respData.(maybeError); ok {
 		if err := maybeError.Err(); err != nil {
+			// Handle human verification (CAPTCHA) - free accounts without Sentinel
+			if apiErr, ok := err.(*APIError); ok && apiErr.Code == humanVerificationCode && !retried {
+				details := apiErr.Details
+				// Try to extract Details from raw JSON if not already parsed via resp struct
+				if details == nil || details.Token == "" {
+					var raw struct {
+						Details *HumanVerificationDetails `json:"Details"`
+					}
+					if json.Unmarshal(bodyBytes, &raw) == nil && raw.Details != nil {
+						details = raw.Details
+						apiErr.Details = details
+					}
+				}
+				if details != nil && details.Token != "" {
+					token := details.Token
+					methods := details.Methods
+					if len(methods) == 0 {
+						methods = []string{"captcha"}
+					}
+					method := methods[0]
+					verifyURL := fmt.Sprintf("https://verify.proton.me/?token=%s&methods=%s", token, strings.Join(methods, ","))
+					// Also try embed URL as proton-sdk does
+					embedURL := fmt.Sprintf("https://verify.proton.me/?embed=1&methods=%s&token=%s", strings.Join(methods, ","), token)
+
+					// Allow non-interactive override via env
+					envHV := os.Getenv("FERROXIDE_HV_TOKEN")
+					if envHV == "" {
+						envHV = os.Getenv("HYDROXIDE_HV_TOKEN")
+					}
+
+					var hvToken, hvType string
+					if envHV != "" {
+						hvToken = strings.TrimSpace(envHV)
+						hvType = method
+						fmt.Fprintf(os.Stderr, "\n=== Human Verification Required (CAPTCHA) ===\n")
+						fmt.Fprintf(os.Stderr, "Using verification token from environment (%s)\n", hvTokenHeader)
+					} else {
+						fmt.Fprintf(os.Stderr, "\n=== Human Verification Required (CAPTCHA) ===\n")
+						fmt.Fprintf(os.Stderr, "Proton returned code 9001. Free accounts can solve without Sentinel.\n")
+						fmt.Fprintf(os.Stderr, "Challenge token: %s (methods: %s)\n", token, strings.Join(methods, ","))
+						fmt.Fprintf(os.Stderr, "\nOPTION A - Try challenge token (works if verify.proton.me marks server-side):\n")
+						fmt.Fprintf(os.Stderr, "  1) Open in browser and solve CAPTCHA:\n     %s\n", verifyURL)
+						fmt.Fprintf(os.Stderr, "     (or embed: %s)\n", embedURL)
+						fmt.Fprintf(os.Stderr, "  2) Return here and press ENTER to retry with challenge token.\n")
+						fmt.Fprintf(os.Stderr, "\nOPTION B - If OPTION A still returns 9001/1000 CAPTCHA, you need the SOLVED token:\n")
+						fmt.Fprintf(os.Stderr, "  1) Open the embed URL above, BEFORE solving open DevTools (F12) -> Console\n")
+						fmt.Fprintf(os.Stderr, "  2) Paste and run: window.addEventListener('message', e=>console.log('HV_SOLVED_TOKEN:', e.data))\n")
+						fmt.Fprintf(os.Stderr, "  3) Solve CAPTCHA, console will log HV_SOLVED_TOKEN (long string like captcha--...)\n")
+						fmt.Fprintf(os.Stderr, "  4) Copy that token and paste it below.\n")
+						fmt.Fprintf(os.Stderr, "  Alternatively, after solving check DevTools -> Application -> Local Storage -> https://verify.proton.me\n")
+						fmt.Fprintf(os.Stderr, "\nPaste SOLVED token here (or press ENTER to try challenge token):\n> ")
+
+						reader := bufio.NewReader(os.Stdin)
+						input, _ := reader.ReadString('\n')
+						input = strings.TrimSpace(input)
+
+						hvToken = token
+						hvType = method
+						if input != "" {
+							hvToken = input
+							if strings.Contains(input, "--") {
+								hvType = "captcha"
+							}
+							fmt.Fprintf(os.Stderr, "Using pasted SOLVED verification token (type %s)\n", hvType)
+						} else {
+							fmt.Fprintf(os.Stderr, "Retrying with challenge token (after browser verification)...\n")
+							fmt.Fprintf(os.Stderr, "If this still fails with [9001] or [1000] CAPTCHA, re-run and paste the SOLVED token from Console.\n")
+						}
+					}
+
+					// Clone request for retry - need to reset body
+					if req.GetBody == nil && req.Body != nil {
+						log.Printf("cannot retry human verification: request has no GetBody")
+						return err
+					}
+					// Set HV headers for retry
+					req.Header.Set(hvTokenHeader, hvToken)
+					req.Header.Set(hvTokenTypeHeader, hvType)
+
+					// Reset body if needed
+					if req.GetBody != nil {
+						newBody, err := req.GetBody()
+						if err != nil {
+							return err
+						}
+						req.Body = newBody
+					}
+
+					// Clear respData to avoid stale fields (json.Unmarshal doesn't clear missing fields)
+					if respData != nil {
+						rv := reflect.ValueOf(respData)
+						if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+							rv.Elem().Set(reflect.Zero(rv.Elem().Type()))
+						}
+					}
+					log.Printf("Retrying request with human verification token (type=%s)...", hvType)
+					return c.doJSONWithHVRetry(req, respData, true)
+				}
+			}
 			log.Printf("request failed: %v %v: %v", req.Method, req.URL.String(), err)
 			return err
 		}
